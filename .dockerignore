@@ -1,0 +1,11 @@
+node_modules
+.next
+dist
+.git
+.sites-runtime
+.wrangler
+*.zip
+backend/__pycache__
+backend/.pytest_cache
+backend/**/*.pyc
+
