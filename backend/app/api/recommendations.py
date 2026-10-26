@@ -2,6 +2,7 @@ from fastapi import APIRouter, Depends, HTTPException, Query, status
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
+from app.services.gemini_service import rerank_recommendations
 
 from app.core.database import get_db
 from app.dependencies import get_current_user
@@ -51,8 +52,31 @@ async def recommendations(
         .limit(300)
     )
     feedbacks = list(feedback_result.scalars().all())
-    ranked = rank_contents(contents, preference, interactions, feedbacks)[:limit]
+    local_ranked = rank_contents(
+        contents=contents,
+        preference=preference,
+        interactions=interactions,
+        feedbacks=feedbacks,
+    )
 
+    candidate_limit = min(30, len(local_ranked))
+    candidates = local_ranked[:candidate_limit]
+
+    gemini_ranked = await rerank_recommendations(
+        candidates=candidates,
+        preference=preference,
+        interactions=interactions,
+        feedbacks=feedbacks,
+        limit=limit,
+    )
+
+    if gemini_ranked is not None:
+        ranked = gemini_ranked
+        provider = "gemini"
+    else:
+        ranked = local_ranked[:limit]
+        provider = "local"
+    
     items = [
         RecommendationItem(content=content, score=score, reason=reason)
         for content, score, reason in ranked
@@ -68,7 +92,10 @@ async def recommendations(
             )
         )
     await db.commit()
-    return RecommendationResponse(items=items)
+    return RecommendationResponse(
+    items=items,
+    provider=provider,
+)
 
 
 @router.post("/feedback", status_code=status.HTTP_201_CREATED)

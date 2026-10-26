@@ -1,6 +1,7 @@
 import re
+import unicodedata
+import json
 
-import httpx
 from fastapi import APIRouter, Depends, status
 from sqlalchemy import delete, select
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -16,20 +17,56 @@ from app.schemas import (
     ChatMessagePublic,
 )
 
+from app.services.gemini_service import generate_assistant_answer
+
 
 router = APIRouter(prefix="/assistant", tags=["Assistente IA"])
 
 STOP_WORDS = {
     "uma", "para", "que", "com", "por", "dos", "das", "quero",
-    "gostaria", "sobre", "mais",
+    "gostaria", "sobre", "mais", "voce", "você", "pode", "algum",
+    "alguma", "meu", "minha", "seu", "sua",
 }
+
+
+def _normalize(text: str) -> str:
+    normalized = unicodedata.normalize("NFD", text.lower())
+    return "".join(character for character in normalized if unicodedata.category(character) != "Mn")
 
 
 def _tokens(text: str) -> set[str]:
     return {
-        word for word in re.findall(r"[a-zá-ú0-9]+", text.lower())
+        word for word in re.findall(r"[a-z0-9]+", _normalize(text))
         if len(word) > 2 and word not in STOP_WORDS
     }
+
+
+def _small_talk_answer(message: str, user_name: str) -> str | None:
+    normalized = _normalize(message).strip()
+    words = set(re.findall(r"[a-z0-9]+", normalized))
+    first_name = user_name.split()[0] if user_name else ""
+
+    if words and words.issubset({"oi", "ola", "hey", "opa", "bom", "dia", "boa", "tarde", "noite"}):
+        greeting = f", {first_name}" if first_name else ""
+        return (
+            f"Olá{greeting}! Posso indicar e comparar filmes, músicas, livros, cursos e produtos. "
+            "O que você está com vontade de descobrir hoje?"
+        )
+    if words.intersection({"obrigado", "obrigada", "valeu", "agradecido", "agradecida"}):
+        return "Por nada! Se quiser, posso trazer outra opção ou comparar os conteúdos que apareceram."
+    if "tudo bem" in normalized or "como voce esta" in normalized:
+        return "Tudo certo por aqui e pronto para ajudar. Você quer uma indicação ou deseja comparar conteúdos?"
+    if (
+        "o que voce faz" in normalized
+        or "como voce funciona" in normalized
+        or words.intersection({"ajuda", "ajudar", "opcoes", "funcoes"})
+    ):
+        return (
+            "Eu uso o catálogo, suas preferências e o contexto da conversa para indicar ou comparar conteúdos. "
+            "Você pode pedir, por exemplo: “um filme de ficção científica”, “um curso para iniciantes” "
+            "ou “outra opção parecida”."
+        )
+    return None
 
 
 def _score_contents(
@@ -37,7 +74,7 @@ def _score_contents(
     contents: list[Content],
     history: list[ChatMessage],
     preferred_domains: set[str],
-) -> list[Content]:
+) -> tuple[list[Content], bool]:
     current_tokens = _tokens(message)
     context_tokens: set[str] = set()
     for item in history[-4:]:
@@ -45,12 +82,37 @@ def _score_contents(
             context_tokens.update(_tokens(item.content))
 
     aliases = {
-        "filme": {"filme", "filmes", "cinema"},
-        "musica": {"musica", "música", "musicas", "músicas", "canção", "som"},
-        "livro": {"livro", "livros", "leitura", "romance"},
+        "filme": {"filme", "filmes", "cinema", "assistir"},
+        "musica": {"musica", "musicas", "cancao", "som", "ouvir"},
+        "livro": {"livro", "livros", "leitura", "romance", "ler"},
         "curso": {"curso", "cursos", "aprender", "estudar", "aula"},
-        "produto": {"produto", "produtos", "comprar", "equipamento"},
+        "produto": {"produto", "produtos", "comprar", "equipamento", "dispositivo"},
     }
+
+    mood_aliases = {
+        "leve": {"comedia", "animacao", "fabula", "bossa", "mpb", "iniciante", "otimista"},
+        "calmo": {"calma", "tranquila", "classica", "bossa", "contemplacao"},
+        "tranquilo": {"calma", "tranquila", "classica", "bossa", "contemplacao"},
+        "tecnologia": {"tecnologia", "programacao", "dados", "informatica", "computacao"},
+        "fantasia": {"fantasia", "aventura", "fabula"},
+    }
+
+    requested_domains = {
+        domain for domain, words in aliases.items() if current_tokens.intersection(words)
+    }
+    requested_moods = {
+        mood for mood in mood_aliases if mood in current_tokens
+    }
+    recently_suggested: set[int] = set()
+    for item in history[-6:]:
+        if item.role == "assistant":
+            recently_suggested.update(
+                int(source["content_id"])
+                for source in (item.sources or [])
+                if isinstance(source, dict) and str(source.get("content_id", "")).isdigit()
+            )
+
+    wants_another = bool(current_tokens.intersection({"outra", "outro", "diferente", "alternativa"}))
 
     matches: list[tuple[float, Content]] = []
     for content in contents:
@@ -59,18 +121,31 @@ def _score_contents(
         )
         score = len(current_tokens.intersection(content_tokens)) * 3.0
         score += len(context_tokens.intersection(content_tokens)) * 0.35
-        if current_tokens.intersection(aliases.get(content.domain, set())):
-            score += 4.0
+        if content.domain in requested_domains:
+            score += 5.0
         if content.domain in preferred_domains:
-            score += 0.8
+            score += 1.2
+        normalized_title = _normalize(content.title)
+        if normalized_title in _normalize(message):
+            score += 10.0
+        for mood in requested_moods:
+            score += len(content_tokens.intersection(mood_aliases[mood])) * 2.0
+        if wants_another and content.id in recently_suggested:
+            score -= 4.0
         matches.append((score, content))
 
     matches.sort(key=lambda item: (-item[0], item[1].title.lower()))
     positive = [content for score, content in matches if score > 0]
-    return (positive or [content for _, content in matches])[:4]
+    fallback = [content for _, content in matches if content.domain in preferred_domains]
+    return (positive or fallback or [content for _, content in matches])[:4], bool(positive)
 
 
-def _local_answer(message: str, selected: list[Content], history: list[ChatMessage]) -> str:
+def _local_answer(
+    message: str,
+    selected: list[Content],
+    history: list[ChatMessage],
+    matched: bool,
+) -> str:
     if not selected:
         return "O catálogo ainda está vazio. Peça ao administrador para cadastrar conteúdos primeiro."
 
@@ -87,60 +162,84 @@ def _local_answer(message: str, selected: list[Content], history: list[ChatMessa
     primary = selected[0]
     alternatives = ", ".join(item.title for item in selected[1:3])
     follow_up = any(item.role == "user" for item in history)
-    prefix = "Considerando também nossa conversa, " if follow_up else ""
+    wants_another = bool(_tokens(message).intersection({"outra", "outro", "diferente", "alternativa"}))
+    if wants_another:
+        prefix = "Claro — buscando uma opção diferente, "
+    elif follow_up:
+        prefix = "Considerando também nossa conversa, "
+    elif not matched:
+        prefix = "Não encontrei uma correspondência exata, mas considerando seus interesses, "
+    else:
+        prefix = ""
     answer = (
         f"{prefix}minha principal indicação é {primary.title}. "
         f"É um conteúdo de {primary.category.lower()}: {primary.description}"
     )
     if alternatives:
         answer += f" Como alternativas, veja também {alternatives}."
-    answer += " Se quiser, diga se prefere algo mais leve, mais avançado ou de outra categoria."
+    answer += " Você prefere manter esse estilo ou quer uma alternativa diferente?"
     return answer
-
 
 async def _online_answer(
     message: str,
     contents: list[Content],
     history: list[ChatMessage],
 ) -> str | None:
-    if not settings.openai_api_key:
-        return None
-    catalog = "\n".join(
-        f"- {item.title} | {item.domain} | {item.category} | {item.description}"
-        for item in contents[:20]
-    )
-    messages = [
+    catalog = [
         {
-            "role": "system",
-            "content": (
-                "Você é o assistente do Sistema de Recomendação Multidomínio. "
-                "Responda em português claro e use prioritariamente o catálogo abaixo. "
-                "Não invente itens como se estivessem cadastrados.\n\nCATÁLOGO:\n" + catalog
-            ),
-        },
-        *[
-            {"role": item.role, "content": item.content}
-            for item in history[-8:]
-            if item.role in {"user", "assistant"}
-        ],
-        {"role": "user", "content": message},
+            "id": content.id,
+            "titulo": content.title,
+            "dominio": content.domain,
+            "categoria": content.category,
+            "descricao": content.description[:500],
+        }
+        for content in contents[:50]
     ]
-    try:
-        async with httpx.AsyncClient(timeout=20) as client:
-            response = await client.post(
-                "https://api.openai.com/v1/chat/completions",
-                headers={
-                    "Authorization": f"Bearer {settings.openai_api_key}",
-                    "Content-Type": "application/json",
-                },
-                json={"model": settings.openai_model, "messages": messages, "temperature": 0.6},
-            )
-            response.raise_for_status()
-            data = response.json()
-            return str(data["choices"][0]["message"]["content"]).strip()
-    except (httpx.HTTPError, KeyError, IndexError, TypeError):
-        return None
 
+    conversation = [
+        {
+            "papel": chat.role,
+            "mensagem": chat.message,
+        }
+        for chat in history[-12:]
+    ]
+
+    prompt = f"""
+Você é o assistente do Sistema de Recomendação Multidomínio.
+
+Converse de forma natural, educada e objetiva em português do Brasil.
+
+Você pode:
+
+- cumprimentar o usuário;
+- responder dúvidas sobre o funcionamento do sistema;
+- recomendar filmes, músicas, livros, cursos e produtos;
+- comparar conteúdos;
+- explicar por que determinado conteúdo foi recomendado;
+- considerar o histórico recente da conversa.
+
+Quando fizer recomendações relacionadas ao catálogo:
+
+1. Use somente conteúdos presentes no catálogo enviado.
+2. Não invente títulos que não existem no catálogo.
+3. Cite no máximo três conteúdos por resposta.
+4. Explique resumidamente o motivo de cada indicação.
+5. Se não houver conteúdo adequado, avise claramente.
+
+Catálogo disponível:
+
+{json.dumps(catalog, ensure_ascii=False, indent=2)}
+
+Histórico recente:
+
+{json.dumps(conversation, ensure_ascii=False, indent=2)}
+
+Mensagem atual do usuário:
+
+{message}
+""".strip()
+
+    return await generate_assistant_answer(prompt)
 
 @router.get("/history", response_model=list[ChatMessagePublic])
 async def chat_history(
@@ -186,12 +285,20 @@ async def chat(
         select(UserPreference).where(UserPreference.user_id == user.id)
     )
     preferred_domains = set((preference.profile if preference else {}).get("preferred_domains", []))
-    selected = _score_contents(payload.message, contents, history, preferred_domains)
-
-    answer = await _online_answer(payload.message, contents, history)
-    provider = "online" if answer else "local"
-    if not answer:
-        answer = _local_answer(payload.message, selected, history)
+    small_talk = _small_talk_answer(payload.message, user.name)
+    selected: list[Content] = []
+    matched = False
+    if small_talk:
+        answer = small_talk
+        provider = "local"
+    else:
+        selected, matched = _score_contents(
+            payload.message, contents, history, preferred_domains
+        )
+        answer = await _online_answer(payload.message, contents, history)
+        provider = "online" if answer else "local"
+        if not answer:
+            answer = _local_answer(payload.message, selected, history, matched)
 
     sources = [
         AssistantSource(content_id=item.id, title=item.title, domain=item.domain)

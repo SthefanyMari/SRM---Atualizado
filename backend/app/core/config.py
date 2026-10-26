@@ -21,8 +21,12 @@ class Settings(BaseSettings):
     secure_cookies: bool = False
     session_days: int = 7
     reset_token_minutes: int = 30
+    
     openai_api_key: str | None = None
     openai_model: str = "gpt-4o-mini"
+
+    gemini_api_key: str | None = None
+    gemini_model: str = "gemini-3.8-flash"
 
     admin_name: str = "Administrador"
     admin_email: EmailStr = "admin@recomenda.com"

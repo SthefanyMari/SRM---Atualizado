@@ -1,9 +1,20 @@
 from fastapi import APIRouter
 
-from app.api import admin, assistant, auth, contents, domains, health, interactions, preferences, recommendations
+from app.api import (
+    admin,
+    assistant,
+    auth,
+    contents,
+    domains,
+    health,
+    interactions,
+    preferences,
+    recommendations,
+)
 
 
 api_router = APIRouter()
+
 api_router.include_router(auth.router, prefix="/api/v1")
 api_router.include_router(contents.router, prefix="/api/v1")
 api_router.include_router(domains.router, prefix="/api/v1")

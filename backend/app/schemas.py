@@ -157,10 +157,9 @@ class RecommendationItem(BaseModel):
     score: float
     reason: str
 
-
 class RecommendationResponse(BaseModel):
     items: list[RecommendationItem]
-
+    provider: str = "local"
 
 class FeedbackCreate(BaseModel):
     content_id: int

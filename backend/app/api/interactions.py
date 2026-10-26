@@ -33,8 +33,12 @@ async def register_interaction(
     )
     db.add(interaction)
     await db.commit()
-    await db.refresh(interaction)
-    return interaction
+    result = await db.execute(
+    select(Interaction)
+    .options(selectinload(Interaction.content))
+    .where(Interaction.id == interaction.id)
+) 
+    return result.scalar_one()
 
 
 @router.get("/history", response_model=list[InteractionPublic])
